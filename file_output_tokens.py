@@ -395,27 +395,15 @@ class TOKENS_OT_update(bpy.types.Operator):
     bl_description = "Download and install the latest version from GitHub"
 
     def execute(self, context):
-        prefs = context.preferences.addons[__name__].preferences
-        token = prefs.github_token.strip()
-        if not token:
-            self.report({"ERROR"}, "No GitHub token set in preferences")
-            return {"CANCELLED"}
-
-        api_url = (f"https://api.github.com/repos/{_GITHUB_OWNER}/{_GITHUB_REPO}"
-                   f"/contents/{_GITHUB_FILE}?ref={_GITHUB_BRANCH}")
-        req = urllib.request.Request(api_url, headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Blender-Addon-Updater",
-        })
+        raw_url = (f"https://raw.githubusercontent.com/{_GITHUB_OWNER}/{_GITHUB_REPO}"
+                   f"/{_GITHUB_BRANCH}/{_GITHUB_FILE}")
+        req = urllib.request.Request(raw_url, headers={"User-Agent": "Blender-Addon-Updater"})
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
+                content = resp.read().decode("utf-8")
         except Exception as e:
             self.report({"ERROR"}, f"Fetch failed: {e}")
             return {"CANCELLED"}
-
-        content = base64.b64decode(data["content"]).decode("utf-8")
 
         # Parse remote version
         m = re.search(r'"version":\s*\((\d+),\s*(\d+),\s*(\d+)\)', content)
@@ -451,12 +439,6 @@ class TOKENS_OT_update(bpy.types.Operator):
 class TOKENS_Preferences(bpy.types.AddonPreferences):
     bl_idname = __name__
 
-    github_token: StringProperty(
-        name="GitHub Token",
-        description="Personal access token (repo scope) for auto-update",
-        subtype="PASSWORD",
-        default="",
-    )
     show_reference: BoolProperty(
         name="Show Token Reference",
         default=True,
@@ -470,7 +452,6 @@ class TOKENS_Preferences(bpy.types.AddonPreferences):
         row = box.row(align=True)
         row.label(text=f"Version: {'.'.join(map(str, bl_info['version']))}", icon="INFO")
         row.operator("render_tokens.update", icon="FILE_REFRESH")
-        box.prop(self, "github_token")
 
         layout.separator(factor=0.5)
 
