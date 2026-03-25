@@ -395,12 +395,16 @@ class TOKENS_OT_update(bpy.types.Operator):
     bl_description = "Download and install the latest version from GitHub"
 
     def execute(self, context):
-        raw_url = (f"https://raw.githubusercontent.com/{_GITHUB_OWNER}/{_GITHUB_REPO}"
-                   f"/{_GITHUB_BRANCH}/{_GITHUB_FILE}")
-        req = urllib.request.Request(raw_url, headers={"User-Agent": "Blender-Addon-Updater"})
+        api_url = (f"https://api.github.com/repos/{_GITHUB_OWNER}/{_GITHUB_REPO}"
+                   f"/contents/{_GITHUB_FILE}?ref={_GITHUB_BRANCH}")
+        req = urllib.request.Request(api_url, headers={
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "Blender-Addon-Updater",
+        })
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                content = resp.read().decode("utf-8")
+                data = json.loads(resp.read().decode())
+            content = base64.b64decode(data["content"]).decode("utf-8")
         except Exception as e:
             self.report({"ERROR"}, f"Fetch failed: {e}")
             return {"CANCELLED"}
