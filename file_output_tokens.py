@@ -21,7 +21,7 @@ from bpy.props import (StringProperty, BoolProperty, EnumProperty,
                        CollectionProperty, IntProperty)
 
 # ─── Update config (filled in after GitHub repo is created) ──────
-_GITHUB_OWNER = "walinzal"           # set to your GitHub username
+_GITHUB_OWNER = "NicklasMar"
 _GITHUB_REPO  = "blender-render-tokens"
 _GITHUB_FILE  = "file_output_tokens.py"
 _GITHUB_BRANCH = "main"
