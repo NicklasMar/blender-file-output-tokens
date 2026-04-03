@@ -1,26 +1,25 @@
 # File Output Render Tokens
 
-A Blender addon that brings a file output token system to **File Output nodes** and the **render filepath**. Set up your output paths once using tokens — they resolve automatically at render time.
+A Blender addon that brings a file output token system to **File Output nodes** and the **render filepath**. Set up paths once — tokens resolve automatically at render time.
+
+![UI Preview](docs/preview.png)
 
 ## Features
 
-- Tokens resolve in File Output nodes and the render output filepath
-- Live **Path Preview** in the Compositor sidebar and Output Properties
+- Live **Path Preview** in Compositor sidebar and Output Properties
 - **Version control** with one-click increment/decrement
 - **Token Presets** for fast node setup (Beauty, Cryptomatte, AOV)
 - **Rename any token** to match your studio's naming convention
-- Compatible with Blender 3.0 and later
+- Blender 3.0+
 
 ## Installation
 
 1. Download `file_output_tokens_v1.0.0.zip`
-2. Open Blender → **Edit → Preferences → Add-ons**
-3. Click **Install** and select the ZIP file
-4. Enable **File Output Render Tokens**
+2. Blender → **Edit → Preferences → Add-ons → Install**
+3. Select the ZIP and enable **File Output Render Tokens**
 
 ## Tokens
 
-### Project
 | Token | Resolves to |
 |---|---|
 | `$prj` | Project filename (no extension) |
@@ -33,25 +32,13 @@ A Blender addon that brings a file output token system to **File Output nodes** 
 | `$range` | Frame range e.g. 1-250 |
 | `$fps` | Frame rate |
 | `$version` | Version number, zero-padded (001) |
-
-### Date / Time
-| Token | Resolves to |
-|---|---|
-| `$YYYY` | Year (4-digit) |
-| `$YY` | Year (2-digit) |
-| `$MM` | Month (01-12) |
-| `$DD` | Day (01-31) |
-| `$hh` | Hour (00-23) |
-| `$mm` | Minute (00-59) |
-| `$ss` | Second (00-59) |
-
-### System
-| Token | Resolves to |
-|---|---|
-| `$Author` | Author (stamp note or OS user) |
+| `$YYYY` / `$YY` | Year (4- or 2-digit) |
+| `$MM` / `$DD` | Month / Day |
+| `$hh` / `$mm` / `$ss` | Hour / Minute / Second |
+| `$Author` | Stamp note or OS user |
 | `$Username` | OS username |
-| `$Computer` | Computer hostname |
-| `$Renderer` | Render engine (e.g. Cycles, EEVEE) |
+| `$Computer` | Hostname |
+| `$Renderer` | Render engine (Cycles, EEVEE) |
 | `$Height` | Render height e.g. 1080p |
 
 ## Default Presets
@@ -62,10 +49,8 @@ A Blender addon that brings a file output token system to **File Output nodes** 
 | Cryptomatte | `//Export/$prj/$version/$camera/Cryptomatte/` | `$camera_$version_Cryptomatte_` |
 | AOV | `//Export/$prj/$version/$camera/AOV/` | `$camera_$version_$pass_` |
 
-## Renaming Tokens
-
-Go to **Edit → Preferences → Add-ons → File Output Render Tokens → Show & Rename Tokens** to assign custom names to any token. Useful for studio pipelines with fixed naming conventions.
+Custom token names: **Edit → Preferences → Add-ons → File Output Render Tokens → Show & Rename Tokens**
 
 ## License
 
-GPL v3 — see [LICENSE](LICENSE). Any derivative work must also be released under GPL v3.
+GPL v3 — see [LICENSE](LICENSE). Derivative works must also be open source.
