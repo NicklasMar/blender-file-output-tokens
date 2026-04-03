@@ -668,9 +668,12 @@ class TOKENS_Preferences(bpy.types.AddonPreferences):
     def draw(self, context):
         layout = self.layout
 
-        row = layout.row(align=True)
-        row.operator("render_tokens.update", icon="FILE_REFRESH")
-        row.label(text="v" + ".".join(str(x) for x in bl_info["version"]))
+        row = layout.row()
+        split = row.split(factor=0.15)
+        split.label(text="Version")
+        split.label(text=".".join(str(x) for x in bl_info["version"]))
+
+        layout.operator("render_tokens.update", icon="FILE_REFRESH")
 
         layout.separator(factor=0.5)
 
