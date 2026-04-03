@@ -2,9 +2,7 @@
 
 A Blender addon that brings a file output token system to **File Output nodes** and the **render filepath**. Set up paths once — tokens resolve automatically at render time.
 
-![UI Preview](docs/preview.png)
-
-
+<img src="docs/preview.png" width="300"/> <img src="docs/rename_tokens.png" width="300"/>
 
 ## Features
 
@@ -52,8 +50,6 @@ A Blender addon that brings a file output token system to **File Output nodes** 
 | AOV | `//Export/$prj/$version/$camera/AOV/` | `$camera_$version_$pass_` |
 
 Custom token names: **Edit → Preferences → Add-ons → File Output Render Tokens → Show & Rename Tokens**
-
-![Rename Tokens](docs/rename_tokens.png)
 
 ## License
 
