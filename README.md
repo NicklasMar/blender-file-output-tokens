@@ -57,6 +57,11 @@ A Blender addon that brings a file output token system to **File Output nodes** 
 
 Custom token names: **Edit → Preferences → Add-ons → File Output Render Tokens → Show & Rename Tokens**
 
+## Credits
+
+Created and maintained by **Nicklas.mar**.
+If you use or build upon this addon, credit is appreciated.
+
 ## License
 
-GPL v3 — see [LICENSE](LICENSE). Derivative works must also be open source.
+GPL v3 — see [LICENSE](LICENSE). Derivative works must also be released as open source under GPL v3. The copyright notice in the source file must not be removed or altered.

@@ -1,3 +1,17 @@
+# ============================================================
+# File Output Render Tokens — Blender Addon
+# Copyright (c) 2026 Nicklas.mar. All rights reserved.
+#
+# Licensed under the GNU General Public License v3.0.
+# You may use, modify, and distribute this software, but any
+# derivative work must also be released under GPL v3.
+#
+# Original author: Nicklas.mar
+# Repository: https://github.com/NicklasMar/blender-render-tokens
+#
+# Removing or altering this notice is prohibited.
+# ============================================================
+
 bl_info = {
     "name": "File Output Render Tokens",
     "author": "Nicklas.mar",
