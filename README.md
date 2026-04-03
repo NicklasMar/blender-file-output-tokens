@@ -13,6 +13,7 @@ A Blender addon that brings a file output token system to **File Output nodes** 
 <img src="docs/preview.png" width="500"/>
 
 **Show & Rename Tokens** — Assign custom names to any token for studio pipelines.
+
 *Edit → Preferences → Add-ons → File Output Render Tokens → Show & Rename Tokens*
 
 <img src="docs/rename_tokens.png" width="500"/>
