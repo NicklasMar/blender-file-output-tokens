@@ -4,7 +4,7 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (3, 0, 0),
     "location": "Compositor > Sidebar > Render Tokens | Properties > Output",
-    "description": "Cinema 4D-style render tokens for File Output nodes and Render Output (Blender 5.0 compatible)",
+    "description": "Render tokens for File Output nodes and the render filepath",
     "category": "Compositing",
     "doc_url": "https://github.com/NicklasMar/blender-render-tokens",
 }
@@ -63,35 +63,55 @@ def resolve_tokens(path, scene, pass_name="", frame=None):
     computer = socket.gethostname()
     author = render.stamp_note_text if render.use_stamp_note else username
 
+    _ENGINE_NAMES = {
+        "CYCLES":              "Cycles",
+        "BLENDER_EEVEE":       "EEVEE",
+        "BLENDER_EEVEE_NEXT":  "EEVEE",
+        "BLENDER_WORKBENCH":   "Workbench",
+        "BLENDER_GAME":        "BGE",
+    }
+    engine_display = _ENGINE_NAMES.get(render.engine, render.engine)
+
+    try:
+        viewlayer = context.view_layer.name if (context := bpy.context) else scene.view_layers[0].name
+    except Exception:
+        viewlayer = scene.view_layers[0].name if scene.view_layers else ""
+
+    # Build a mapping: default_name -> active token string (custom or default).
+    # _active_token_name() reads addon preferences; falls back silently.
+    def tok(default):
+        return _active_token_name(default)
+
     TOKEN_MAP = {
-        "$cvAuthor":   author,
-        "$cvUsername": username,
-        "$cvComputer": computer,
-        "$cvRenderer": render.engine,
-        "$cvHeight":   f"{ry}p",
-        "$Author":     author,
-        "$Username":   username,
-        "$Computer":   computer,
-        "$Renderer":   render.engine,
-        "$Height":     f"{ry}p",
-        "$userpass":   pass_name,
-        "$camera":     camera,
-        "$range":      f"{scene.frame_start}-{scene.frame_end}",
-        "$frame":      str(frame).zfill(4),
-        "$pass":       pass_name,
-        "$prj":        prj,
-        "$take":       scene.name,
-        "$res":        f"{rx}x{ry}",
-        "$fps":        fps_str,
-        "$rs":         scene.name,
-        "$version":    version,
-        "$YYYY":       now.strftime("%Y"),
-        "$YY":         now.strftime("%y"),
-        "$MM":         now.strftime("%m"),
-        "$DD":         now.strftime("%d"),
-        "$hh":         now.strftime("%H"),
-        "$mm":         now.strftime("%M"),
-        "$ss":         now.strftime("%S"),
+        # $cv* variants — fixed names, not renameable, kept for legacy
+        "$cvAuthor":     author,
+        "$cvUsername":   username,
+        "$cvComputer":   computer,
+        "$cvRenderer":   engine_display,
+        "$cvHeight":     f"{ry}p",
+        # Renameable tokens — keyed by whatever the user called them
+        tok("$Author"):     author,
+        tok("$Username"):   username,
+        tok("$Computer"):   computer,
+        tok("$Renderer"):   engine_display,
+        tok("$Height"):     f"{ry}p",
+        tok("$viewlayer"):  viewlayer,
+        tok("$camera"):     camera,
+        tok("$range"):      f"{scene.frame_start}-{scene.frame_end}",
+        tok("$frame"):      str(frame).zfill(4),
+        tok("$pass"):       pass_name,
+        tok("$prj"):        prj,
+        tok("$take"):       scene.name,
+        tok("$res"):        f"{rx}x{ry}",
+        tok("$fps"):        fps_str,
+        tok("$version"):    version,
+        tok("$YYYY"):       now.strftime("%Y"),
+        tok("$YY"):         now.strftime("%y"),
+        tok("$MM"):         now.strftime("%m"),
+        tok("$DD"):         now.strftime("%d"),
+        tok("$hh"):         now.strftime("%H"),
+        tok("$mm"):         now.strftime("%M"),
+        tok("$ss"):         now.strftime("%S"),
     }
 
     result = path
@@ -165,7 +185,8 @@ def _output_file_nodes(scene):
 
 
 def _get_directory(node):
-    val = getattr(node, "directory", None) or getattr(node, "base_path", "") or ""
+    # base_path is the authoritative attribute in Blender 4.x+; directory is legacy
+    val = getattr(node, "base_path", None) or getattr(node, "directory", "") or ""
     val = val.strip()
     if val.startswith("\\\\"):
         val = "//" + val[2:].replace("\\", "/")
@@ -173,10 +194,18 @@ def _get_directory(node):
 
 
 def _set_directory(node, value):
-    if hasattr(node, "directory"):
-        node.directory = value
-    elif hasattr(node, "base_path"):
-        node.base_path = value
+    # Set both attributes so it works across Blender versions.
+    # In 4.x+ base_path is the real one; directory may be read-only or a no-op alias.
+    set_any = False
+    for attr in ("base_path", "directory"):
+        if hasattr(node, attr):
+            try:
+                setattr(node, attr, value)
+                set_any = True
+            except (AttributeError, TypeError):
+                pass
+    if not set_any:
+        _log(f"WARNING: could not set directory on node — no base_path or directory attr")
 
 
 def _get_file_name(node):
@@ -224,16 +253,23 @@ def _backup_and_resolve(scene):
         nid = node.as_pointer()
         orig_dir = _get_directory(node)
         orig_fn = _get_file_name(node)
-        _originals[nid] = {"directory": orig_dir, "file_name": orig_fn}
+
+        # Backup slot paths (each input slot has its own file subpath)
+        orig_slots = {i: slot.path for i, slot in enumerate(getattr(node, "file_slots", []))}
+
+        _originals[nid] = {"directory": orig_dir, "file_name": orig_fn, "slots": orig_slots}
 
         pass_name = _get_pass_name(node)
-        new_dir = _to_absolute(resolve_tokens(orig_dir, scene, pass_name, frame))
+        # Resolve tokens but keep the // prefix — Blender needs its own relative paths
+        new_dir = resolve_tokens(orig_dir, scene, pass_name, frame)
         new_fn = resolve_tokens(orig_fn, scene, pass_name, frame)
 
         _set_directory(node, new_dir)
         _set_file_name(node, new_fn)
+
+        # Also create the directory on disk
         try:
-            os.makedirs(new_dir, exist_ok=True)
+            os.makedirs(_to_absolute(new_dir), exist_ok=True)
         except OSError as e:
             _log(f"  WARNING: could not create dir '{new_dir}': {e}")
         _log(f"  '{node.name}': directory='{new_dir}'  file_name='{new_fn}'")
@@ -248,6 +284,10 @@ def _restore(scene):
         if nid in _originals:
             _set_directory(node, _originals[nid]["directory"])
             _set_file_name(node, _originals[nid]["file_name"])
+            orig_slots = _originals[nid].get("slots", {})
+            for i, slot in enumerate(getattr(node, "file_slots", [])):
+                if i in orig_slots:
+                    slot.path = orig_slots[i]
     _originals.clear()
     _log("Paths restored.")
 
@@ -258,12 +298,12 @@ def _resolve_for_frame(scene, frame):
         if nid not in _originals:
             continue
         pass_name = _get_pass_name(node)
-        new_dir = _to_absolute(resolve_tokens(_originals[nid]["directory"], scene, pass_name, frame))
+        new_dir = resolve_tokens(_originals[nid]["directory"], scene, pass_name, frame)
         new_fn = resolve_tokens(_originals[nid]["file_name"], scene, pass_name, frame)
         _set_directory(node, new_dir)
         _set_file_name(node, new_fn)
         try:
-            os.makedirs(new_dir, exist_ok=True)
+            os.makedirs(_to_absolute(new_dir), exist_ok=True)
         except OSError as e:
             _log(f"  WARNING: could not create dir '{new_dir}': {e}")
 
@@ -318,27 +358,33 @@ def _scene(args):
 
 
 @persistent
-def _on_render_pre(*args):
+def _on_render_init(*args):
+    """Fires before animation render starts — before Blender caches compositor paths."""
     s = _scene(args)
     if s:
         _backup_and_resolve(s)
 
 
 @persistent
-def _on_render_write(*args):
+def _on_render_pre(*args):
+    """Single-frame fallback: only resolves if render_init didn't already run."""
     s = _scene(args)
-    if not s:
-        return
-    frame = s.frame_current
-    _log(f"render_write — frame {frame}")
-    _rename_frame(s, frame)
-    next_f = frame + s.frame_step
-    if next_f <= s.frame_end:
-        _resolve_for_frame(s, next_f)
+    if s and not _originals:
+        _backup_and_resolve(s)
+
+
+@persistent
+def _on_render_write(*args):
+    pass
 
 
 @persistent
 def _on_render_post(*args):
+    pass
+
+
+@persistent
+def _on_render_complete(*args):
     s = _scene(args)
     if s:
         _restore(s)
@@ -351,19 +397,72 @@ def _on_render_cancel(*args):
         _restore(s)
 
 
+_DEFAULT_RENDER_OUTPUT = "//Export/$prj/$version/$camera/PNG/$camera_$version_PNG_####"
+
+# Blender's built-in default render filepaths (platform-dependent)
+_BLENDER_DEFAULT_OUTPUTS = {"//", "/tmp\\", "/tmp/"}
+
+
+@persistent
+def _on_load_post(*args):
+    try:
+        scene = bpy.context.scene
+        if scene:
+            _ensure_presets_initialized(scene)
+            if scene.render.filepath in _BLENDER_DEFAULT_OUTPUTS:
+                scene.render.filepath = _DEFAULT_RENDER_OUTPUT
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────
+# Default presets
+# ─────────────────────────────────────────────────────────────────
+
+_DEFAULT_PRESETS = [
+    {
+        "name":      "Beauty",
+        "directory": "//Export/$prj/$version/$camera/Beauty/",
+        "file_name": "$camera_$version_Beauty_",
+    },
+    {
+        "name":      "Cryptomatte",
+        "directory": "//Export/$prj/$version/$camera/Cryptomatte/",
+        "file_name": "$camera_$version_Cryptomatte_",
+    },
+    {
+        "name":      "AOV",
+        "directory": "//Export/$prj/$version/$camera/AOV/",
+        "file_name": "$camera_$version_$pass_",
+    },
+]
+
+
+def _ensure_presets_initialized(scene):
+    """Add default presets if the scene has none yet."""
+    if scene is None or len(scene.render_tokens_presets) > 0:
+        return
+    for data in _DEFAULT_PRESETS:
+        p = scene.render_tokens_presets.add()
+        p.name      = data["name"]
+        p.directory = data["directory"]
+        p.file_name = data["file_name"]
+    _log(f"Default presets added to scene '{scene.name}'")
+
+
 # ─────────────────────────────────────────────────────────────────
 # Token data
 # ─────────────────────────────────────────────────────────────────
 
 TOKEN_GROUPS = [
     ("Project", [
-        "$prj", "$camera", "$take", "$pass", "$userpass",
-        "$frame", "$rs", "$res", "$range", "$fps", "$version",
+        "$prj", "$camera", "$viewlayer", "$take", "$pass",
+        "$frame", "$res", "$range", "$fps", "$version",
     ]),
     ("Date / Time", [
         "$YYYY", "$YY", "$MM", "$DD", "$hh", "$mm", "$ss",
     ]),
-    ("CV", [
+    ("System", [
         "$Author", "$Username", "$Computer", "$Renderer", "$Height",
     ]),
 ]
@@ -371,11 +470,10 @@ TOKEN_GROUPS = [
 TOKEN_DESCRIPTIONS = {
     "$prj":        "Project filename (no extension)",
     "$camera":     "Active camera name",
+    "$viewlayer":  "Active view layer name",
     "$take":       "Scene name",
     "$pass":       "First render pass input name",
-    "$userpass":   "Same as $pass",
     "$frame":      "Current frame, zero-padded (0001)",
-    "$rs":         "Scene name",
     "$res":        "Resolution  e.g. 1920x1080",
     "$range":      "Frame range  e.g. 1-250",
     "$fps":        "Frame rate",
@@ -399,14 +497,48 @@ TOKEN_DESCRIPTIONS = {
     "$Height":     "Render height  e.g. 1080p",
 }
 
+# Tokens that can receive a custom alias (shown in preferences)
+_ALIASABLE_TOKENS = [
+    ("$prj",       "Project filename (no extension)"),
+    ("$camera",    "Active camera name"),
+    ("$viewlayer", "Active view layer name"),
+    ("$take",      "Scene name"),
+    ("$pass",   "Render pass input name"),
+    ("$frame",  "Current frame, zero-padded (0001)"),
+    ("$res",    "Resolution e.g. 1920x1080"),
+    ("$range",    "Frame range e.g. 1-250"),
+    ("$fps",      "Frame rate"),
+    ("$version",  "Version number (001)"),
+    ("$YYYY",     "Year (4-digit)"),
+    ("$YY",       "Year (2-digit)"),
+    ("$MM",       "Month (01-12)"),
+    ("$DD",       "Day (01-31)"),
+    ("$hh",       "Hour (00-23)"),
+    ("$mm",       "Minute (00-59)"),
+    ("$ss",       "Second (00-59)"),
+    ("$Author",   "Author (stamp note or OS user)"),
+    ("$Username", "OS username"),
+    ("$Computer", "Computer hostname"),
+    ("$Renderer", "Render engine"),
+    ("$Height",   "Render height e.g. 1080p"),
+]
+
 
 # ─────────────────────────────────────────────────────────────────
-# Property Group
+# Property Groups
 # ─────────────────────────────────────────────────────────────────
+
+class TokenAlias(bpy.types.PropertyGroup):
+    """One row in the token rename table: default_name → custom_name."""
+    default_name: StringProperty(name="Default Token")
+    custom_name:  StringProperty(name="Custom Name", default="",
+                                  description="Leave empty to use the default token name")
+    description:  StringProperty(name="Description")
+
 
 class TokenPreset(bpy.types.PropertyGroup):
     name:      StringProperty(name="Name",      default="New Preset")
-    directory: StringProperty(name="Directory", default="//render/$prj/$camera/")
+    directory: StringProperty(name="Directory", default="//Export/$prj/$camera/")
     file_name: StringProperty(name="File Name", default="$camera_$res_####")
 
 
@@ -465,47 +597,104 @@ class TOKENS_OT_update(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _ensure_aliases_initialized(prefs):
+    """Populate token_aliases with defaults if the list is still empty."""
+    if len(prefs.token_aliases) == 0:
+        for token, desc in _ALIASABLE_TOKENS:
+            a = prefs.token_aliases.add()
+            a.default_name = token
+            a.description  = desc
+            a.custom_name  = token  # editable in-place; user sees the real name
+        _log("Token aliases initialized with defaults")
+
+
+def _active_token_name(default_name):
+    """Return the current (possibly renamed) token string for a given default token."""
+    try:
+        prefs = bpy.context.preferences.addons[__name__].preferences
+        for a in prefs.token_aliases:
+            if a.default_name == default_name:
+                return a.custom_name.strip() or default_name
+    except Exception:
+        pass
+    return default_name
+
+
+class TOKENS_OT_reset_aliases(bpy.types.Operator):
+    bl_idname  = "render_tokens.reset_aliases"
+    bl_label   = "Reset All Token Names"
+    bl_description = "Revert every token name back to the Blender default"
+
+    def execute(self, context):
+        prefs = context.preferences.addons[__name__].preferences
+        for a in prefs.token_aliases:
+            a.custom_name = a.default_name
+        self.report({"INFO"}, "All token names reset to defaults")
+        return {"FINISHED"}
+
+
+class TOKENS_OT_reset_single_alias(bpy.types.Operator):
+    bl_idname  = "render_tokens.reset_single_alias"
+    bl_label   = "Reset Token Name"
+    bl_description = "Revert this token name to its default"
+
+    default_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        prefs = context.preferences.addons[__name__].preferences
+        for a in prefs.token_aliases:
+            if a.default_name == self.default_name:
+                a.custom_name = a.default_name
+                break
+        return {"FINISHED"}
+
+
 class TOKENS_Preferences(bpy.types.AddonPreferences):
     bl_idname = __name__
 
-    show_reference: BoolProperty(
-        name="Show Token Reference",
+    show_aliases: BoolProperty(
+        name="Show & Rename Tokens",
         default=False,
+        description="Show all tokens and assign custom names (company/pipeline presets)",
     )
+    token_aliases: CollectionProperty(type=TokenAlias)
 
     def draw(self, context):
         layout = self.layout
 
-        box = layout.box()
-        col = box.column(align=True)
-
-        row = col.row(align=True)
-        row.label(text="Type: Extension")
-        row.operator("render_tokens.update", icon="FILE_REFRESH", text="")
-
-        col.label(text="Maintainer: Nicklas.mar")
-        col.label(text=f"Version: {'.'.join(map(str, bl_info['version']))}")
-
-        row = col.row()
-        op = row.operator("wm.url_open", text="Website (GitHub)", icon="URL")
-        op.url = "https://github.com/NicklasMar/blender-render-tokens"
+        row = layout.row(align=True)
+        row.operator("render_tokens.update", icon="FILE_REFRESH")
 
         layout.separator(factor=0.5)
 
-        layout.prop(self, "show_reference", toggle=True, icon="QUESTION")
-        if not self.show_reference:
-            return
-
-        for group_name, tokens in TOKEN_GROUPS:
-            col = layout.column(align=True)
-            col.label(text=group_name)
-            for token in tokens:
-                row = col.row(align=True)
-                row.scale_y = 0.8
-                split = row.split(factor=0.28)
-                split.label(text=token)
-                split.label(text=TOKEN_DESCRIPTIONS.get(token, ""))
+        # ── Rename Tokens ─────────────────────────────────────────────────────
+        layout.prop(self, "show_aliases", toggle=True, icon="INFO")
+        if self.show_aliases:
+            _ensure_aliases_initialized(self)
+            abox = layout.box()
+            acol = abox.column(align=True)
+            header = acol.row()
+            header.label(text="Token Name")
+            header.label(text="Resolves to")
+            acol.separator(factor=0.3)
+            for alias in self.token_aliases:
+                changed = alias.custom_name.strip() != alias.default_name
+                row = acol.row(align=True)
+                row.scale_y = 0.85
+                sub = row.row(align=True)
+                sub.scale_x = 0.9
+                sub.prop(alias, "custom_name", text="")
+                if changed:
+                    op = row.operator("render_tokens.reset_single_alias",
+                                      text="", icon="LOOP_BACK", emboss=False)
+                    op.default_name = alias.default_name
+                else:
+                    row.label(text="", icon="BLANK1")
+                row.label(text=alias.description)
+            acol.separator(factor=0.5)
+            acol.operator("render_tokens.reset_aliases", icon="LOOP_BACK")
             layout.separator(factor=0.3)
+
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -569,7 +758,7 @@ class TOKENS_OT_add_preset(bpy.types.Operator):
         presets = context.scene.render_tokens_presets
         p = presets.add()
         p.name = "New Preset"
-        p.directory = "//render/$prj/$camera/"
+        p.directory = "//Export/$prj/$camera/"
         p.file_name = "$camera_$res_####"
         context.scene.render_tokens_preset_index = len(presets) - 1
         return {"FINISHED"}
@@ -698,8 +887,27 @@ class TOKENS_OT_apply_preset(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class TOKENS_OT_move_preset(bpy.types.Operator):
+    bl_idname  = "render_tokens.move_preset"
+    bl_label   = "Move Preset"
+    bl_description = "Move the selected preset up or down"
+
+    direction: EnumProperty(items=[("UP", "Up", ""), ("DOWN", "Down", "")])
+
+    def execute(self, context):
+        presets = context.scene.render_tokens_presets
+        idx = context.scene.render_tokens_preset_index
+        if self.direction == "UP" and idx > 0:
+            presets.move(idx, idx - 1)
+            context.scene.render_tokens_preset_index = idx - 1
+        elif self.direction == "DOWN" and idx < len(presets) - 1:
+            presets.move(idx, idx + 1)
+            context.scene.render_tokens_preset_index = idx + 1
+        return {"FINISHED"}
+
+
 # ─────────────────────────────────────────────────────────────────
-# Panels (sub-panels = native Blender collapse, no custom arrows)
+# Panels
 # ─────────────────────────────────────────────────────────────────
 
 class TOKENS_PT_panel(bpy.types.Panel):
@@ -708,6 +916,7 @@ class TOKENS_PT_panel(bpy.types.Panel):
     bl_space_type = "NODE_EDITOR"
     bl_region_type = "UI"
     bl_category = "Render Tokens"
+    bl_order = 0
 
     @classmethod
     def poll(cls, context):
@@ -718,7 +927,7 @@ class TOKENS_PT_panel(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
 
-        # Paths vom aktiven Node lesen
+        # Read paths from the active node
         node = context.active_node
         if node is not None and node.type == "OUTPUT_FILE":
             pass_name = _get_pass_name(node)
@@ -744,7 +953,7 @@ class TOKENS_PT_panel(bpy.types.Panel):
         box2.scale_y = 0.7
         box2.label(text=resolved_fn)
 
-        # Version — eigene Box
+        # Version control
         vbox = layout.box()
         row = vbox.row(align=True)
         split = row.split(factor=0.75, align=True)
@@ -761,6 +970,7 @@ class TOKENS_PT_reference(bpy.types.Panel):
     bl_region_type = "UI"
     bl_category = "Render Tokens"
     bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 2
 
     def draw(self, context):
         layout = self.layout
@@ -769,17 +979,18 @@ class TOKENS_PT_reference(bpy.types.Panel):
             box = layout.box()
             col = box.column(align=False)
             for token in tokens:
+                active = _active_token_name(token)
                 row = col.row(align=True)
                 row.scale_y = 1.0
                 split = row.split(factor=0.3, align=True)
-                split.label(text=token)
+                split.label(text=active)
                 desc_row = split.row(align=True)
                 desc_row.label(text=TOKEN_DESCRIPTIONS.get(token, ""))
                 sub = desc_row.row()
                 sub.alignment = "RIGHT"
                 sub.scale_x = 1.8
                 op = sub.operator("render_tokens.copy_token", text="", icon="COPYDOWN")
-                op.token = token
+                op.token = active   # copy the current (possibly renamed) name
             layout.separator(factor=0.3)
 
 
@@ -790,6 +1001,7 @@ class TOKENS_PT_presets(bpy.types.Panel):
     bl_region_type = "UI"
     bl_category = "Render Tokens"
     bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 1
 
     def draw(self, context):
         layout = self.layout
@@ -806,6 +1018,9 @@ class TOKENS_PT_presets(bpy.types.Panel):
         col = row.column(align=True)
         col.operator("render_tokens.add_preset", icon="ADD", text="")
         col.operator("render_tokens.remove_preset", icon="REMOVE", text="")
+        col.separator()
+        col.operator("render_tokens.move_preset", icon="TRIA_UP",   text="").direction = "UP"
+        col.operator("render_tokens.move_preset", icon="TRIA_DOWN", text="").direction = "DOWN"
 
         # Preset from Node
         if has_node:
@@ -831,9 +1046,75 @@ class TOKENS_PT_presets(bpy.types.Panel):
 # Registration
 # ─────────────────────────────────────────────────────────────────
 
+class TOKENS_PT_output_tokens(bpy.types.Panel):
+    bl_label       = "Tokens"
+    bl_idname      = "TOKENS_PT_output_tokens"
+    bl_space_type  = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context     = "output"
+    bl_parent_id   = "TOKENS_PT_output_props"
+    bl_options     = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        for group_name, tokens in TOKEN_GROUPS:
+            layout.label(text=group_name)
+            box = layout.box()
+            col = box.column(align=True)
+            for token in tokens:
+                active = _active_token_name(token)
+                row    = col.row(align=True)
+                row.scale_y = 0.85
+                split  = row.split(factor=0.3, align=True)
+                split.label(text=active)
+                desc_row = split.row(align=True)
+                desc_row.label(text=TOKEN_DESCRIPTIONS.get(token, ""))
+                sub = desc_row.row()
+                sub.alignment = "RIGHT"
+                sub.scale_x = 1.8
+                op = sub.operator("render_tokens.copy_token", text="", icon="COPYDOWN")
+                op.token = active
+            layout.separator(factor=0.3)
+
+
+class TOKENS_PT_output_props(bpy.types.Panel):
+    bl_label       = "Render Tokens"
+    bl_idname      = "TOKENS_PT_output_props"
+    bl_space_type  = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context     = "output"
+
+    def draw(self, context):
+        layout = self.layout
+        scene  = context.scene
+        resolved = resolve_tokens(scene.render.filepath, scene)
+
+        # ── Path Preview ──────────────────────────────────────────────────────
+        layout.label(text="Path Preview")
+        box = layout.box()
+        box.scale_y = 0.7
+        row = box.row(align=True)
+        row.label(text=resolved if resolved else "—")
+        row.operator("render_tokens.open_folder",
+                     text="", icon="FILE_FOLDER", emboss=False).path = resolved
+
+        # ── Version control ───────────────────────────────────────────────────
+        vbox = layout.box()
+        row  = vbox.row(align=True)
+        split = row.split(factor=0.65, align=True)
+        split.label(text=f"Version: {str(scene.render_tokens_version).zfill(3)}")
+        sub = split.row(align=True)
+        sub.operator("render_tokens.version_dec", text="-")
+        sub.operator("render_tokens.version_inc", text="+")
+
+
+
 CLASSES = [
+    TokenAlias,
     TokenPreset,
     TOKENS_OT_update,
+    TOKENS_OT_reset_aliases,
+    TOKENS_OT_reset_single_alias,
     TOKENS_Preferences,
     TOKENS_UL_presets,
     TOKENS_OT_open_folder,
@@ -847,17 +1128,26 @@ CLASSES = [
     TOKENS_OT_version_dec,
     TOKENS_OT_remove_preset,
     TOKENS_OT_apply_preset,
+    TOKENS_OT_move_preset,
     TOKENS_PT_panel,
     TOKENS_PT_reference,
     TOKENS_PT_presets,
+    TOKENS_PT_output_props,
+    TOKENS_PT_output_tokens,
 ]
+
+def _tag_redraw_all(self, context):
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            area.tag_redraw()
+
 
 _SCENE_PROPS = [
     ("render_tokens_presets",      CollectionProperty(type=TokenPreset)),
     ("render_tokens_preset_index", IntProperty(default=0)),
-    ("render_tokens_version",      IntProperty(name="$version", default=1, min=1, soft_max=999)),
-    ("render_tokens_dir_template",  bpy.props.StringProperty(name="Directory", default="//render/$prj/$version/$camera/")),
-    ("render_tokens_file_template", bpy.props.StringProperty(name="File Name", default="$camera_$pass_####")),
+    ("render_tokens_version",      IntProperty(name="$version", default=1, min=1, soft_max=999, update=_tag_redraw_all)),
+    ("render_tokens_dir_template",        bpy.props.StringProperty(name="Directory", default="//Export/$prj/$version/$camera/")),
+    ("render_tokens_file_template",       bpy.props.StringProperty(name="File Name", default="$camera_$pass_####")),
 ]
 
 
@@ -866,20 +1156,48 @@ def register():
         bpy.utils.register_class(cls)
     for name, prop in _SCENE_PROPS:
         setattr(bpy.types.Scene, name, prop)
+    if hasattr(bpy.app.handlers, "render_init"):
+        bpy.app.handlers.render_init.append(_on_render_init)
     bpy.app.handlers.render_pre.append(_on_render_pre)
     bpy.app.handlers.render_write.append(_on_render_write)
     bpy.app.handlers.render_post.append(_on_render_post)
     bpy.app.handlers.render_cancel.append(_on_render_cancel)
+    if hasattr(bpy.app.handlers, "render_complete"):
+        bpy.app.handlers.render_complete.append(_on_render_complete)
+    bpy.app.handlers.load_post.append(_on_load_post)
+    # Initialize aliases immediately (preferences are always available)
+    try:
+        prefs = bpy.context.preferences.addons[__name__].preferences
+        _ensure_aliases_initialized(prefs)
+    except Exception:
+        pass
+    # Initialize presets after a short delay so bpy.context.scene is ready
+    def _delayed_preset_init():
+        try:
+            scene = bpy.context.scene if bpy.context else None
+            _ensure_presets_initialized(scene)
+            if scene and scene.render.filepath in _BLENDER_DEFAULT_OUTPUTS:
+                scene.render.filepath = _DEFAULT_RENDER_OUTPUT
+        except Exception:
+            pass
+        return None  # do not repeat
+    bpy.app.timers.register(_delayed_preset_init, first_interval=0.1)
     _log("v1.0.0 registered")
 
 
 def unregister():
-    for h, lst in [
+    handlers = [
         (_on_render_pre,    bpy.app.handlers.render_pre),
         (_on_render_write,  bpy.app.handlers.render_write),
         (_on_render_post,   bpy.app.handlers.render_post),
         (_on_render_cancel, bpy.app.handlers.render_cancel),
-    ]:
+        (_on_load_post,     bpy.app.handlers.load_post),
+    ]
+    if hasattr(bpy.app.handlers, "render_init"):
+        handlers.append((_on_render_init,     bpy.app.handlers.render_init))
+    if hasattr(bpy.app.handlers, "render_complete"):
+        handlers.append((_on_render_complete, bpy.app.handlers.render_complete))
+    for h, lst in handlers:
         if h in lst:
             lst.remove(h)
     for name, _ in reversed(_SCENE_PROPS):
