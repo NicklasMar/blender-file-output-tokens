@@ -2,6 +2,12 @@
 
 A Blender addon that brings a file output token system to **File Output nodes** and the **render filepath**. Set up paths once — tokens resolve automatically at render time.
 
+## Installation
+
+1. Download the latest ZIP from [Releases](https://github.com/NicklasMar/blender-render-tokens/releases/latest)
+2. Blender → **Edit → Preferences → Add-ons → Install**
+3. Select the ZIP and enable **File Output Render Tokens**
+
 **Token Panel** — Path Preview, Version control and Presets directly in the Compositor sidebar.
 
 <img src="docs/preview.png" width="500"/>
@@ -17,12 +23,6 @@ A Blender addon that brings a file output token system to **File Output nodes** 
 - **Token Presets** for fast node setup (Beauty, Cryptomatte, AOV)
 - **Rename any token** to match your studio's naming convention
 - Blender 3.0+
-
-## Installation
-
-1. Download the latest ZIP from [Releases](https://github.com/NicklasMar/blender-render-tokens/releases/latest)
-2. Blender → **Edit → Preferences → Add-ons → Install**
-3. Select the ZIP and enable **File Output Render Tokens**
 
 ## Tokens
 
