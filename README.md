@@ -33,7 +33,7 @@ A Blender addon that brings a file output token system to **File Output nodes** 
 | `$prj` | Project filename (no extension) |
 | `$camera` | Active camera name |
 | `$viewlayer` | Active view layer name |
-| `$take` | Scene name |
+| `$scene` | Active scene name |
 | `$pass` | Render pass input name |
 | `$frame` | Current frame, zero-padded (0001) |
 | `$res` | Resolution e.g. 1920x1080 |
