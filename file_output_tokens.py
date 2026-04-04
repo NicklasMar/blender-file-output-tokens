@@ -115,7 +115,7 @@ def resolve_tokens(path, scene, pass_name="", frame=None):
         tok("$frame"):      str(frame).zfill(4),
         tok("$pass"):       pass_name,
         tok("$prj"):        prj,
-        tok("$take"):       scene.name,
+        tok("$scene"):       scene.name,
         tok("$res"):        f"{rx}x{ry}",
         tok("$fps"):        fps_str,
         tok("$version"):    version,
@@ -194,7 +194,7 @@ def _get_compositor_trees(scene):
 def _output_file_nodes(scene):
     for tree in _get_compositor_trees(scene):
         for node in tree.nodes:
-            if node.type == "OUTPUT_FILE":
+            if node.type == "OUTPUT_FILE" and not node.mute:
                 yield node
 
 
@@ -247,15 +247,46 @@ def _expand_hashes(template, frame):
 # ─────────────────────────────────────────────────────────────────
 
 _originals = {}
+_backup_scene_name = None
+_is_animation_render = False
+
+
+def _save_token_templates(scene):
+    """Persist node token paths so they survive third-party overwrites.
+
+    Only call this when the scene is in a known-good state (file load or
+    after the user explicitly applies a preset). Never call from render
+    handlers — by then third-party addons may have already modified paths.
+    """
+    fp = scene.render.filepath
+    if "$" in fp:
+        scene.render_tokens_filepath_template = fp
+
+    for node in _output_file_nodes(scene):
+        d  = _get_directory(node)
+        fn = _get_file_name(node)
+        if "$" not in d and "$" not in fn:
+            continue
+        templates = scene.render_tokens_node_templates
+        item = next((t for t in templates if t.node_name == node.name), None)
+        if item is None:
+            item = templates.add()
+            item.node_name = node.name
+        item.directory = d
+        item.file_name = fn
 
 
 def _backup_and_resolve(scene):
-    global _originals
+    global _originals, _backup_scene_name
     _originals.clear()
+    _backup_scene_name = scene.name
     frame = scene.frame_current
 
-    # Regular render filepath
-    orig_fp = scene.render.filepath
+    # Regular render filepath — persisted template is always authoritative.
+    # Never trust the live filepath here: a third-party addon (e.g. CamOps) may
+    # have already replaced it (possibly still containing $ from co_render_path).
+    stored_fp = getattr(scene, "render_tokens_filepath_template", "")
+    orig_fp = stored_fp if stored_fp else scene.render.filepath
     _originals["__filepath__"] = orig_fp
     scene.render.filepath = resolve_tokens(orig_fp, scene, "", frame)
     _log(f"render_pre — filepath resolved")
@@ -264,9 +295,20 @@ def _backup_and_resolve(scene):
     _log(f"render_pre — {len(nodes)} File Output node(s), frame {frame}")
 
     for node in nodes:
-        nid = node.as_pointer()
-        orig_dir = _get_directory(node)
-        orig_fn = _get_file_name(node)
+        nid = node.name
+
+        # Persisted template is authoritative — use it when available.
+        # This handles the case where a third-party addon overwrote node paths
+        # (even if the overwritten path still contains $ from the custom root).
+        templates = scene.render_tokens_node_templates
+        tmpl = next((t for t in templates if t.node_name == node.name), None)
+        if tmpl:
+            orig_dir = tmpl.directory
+            orig_fn  = tmpl.file_name
+            _log(f"  '{node.name}': using persisted template")
+        else:
+            orig_dir = _get_directory(node)
+            orig_fn  = _get_file_name(node)
 
         # Backup slot paths (each input slot has its own file subpath)
         orig_slots = {i: slot.path for i, slot in enumerate(getattr(node, "file_slots", []))}
@@ -291,15 +333,32 @@ def _backup_and_resolve(scene):
         _log(f"  '{node.name}': directory='{new_dir}'  file_name='{new_fn}'")
 
 
-def _restore(scene):
-    global _originals
-    if "__filepath__" in _originals:
+def _restore(scene=None):
+    global _originals, _backup_scene_name
+    if scene is None and _backup_scene_name:
+        scene = bpy.data.scenes.get(_backup_scene_name)
+    if scene is None:
+        _originals.clear()
+        return
+    # Render filepath: persistent template wins, _originals as fallback
+    fp_tmpl = getattr(scene, "render_tokens_filepath_template", "")
+    if fp_tmpl:
+        scene.render.filepath = fp_tmpl
+    elif "__filepath__" in _originals:
         scene.render.filepath = _originals["__filepath__"]
+
     for node in _output_file_nodes(scene):
-        nid = node.as_pointer()
-        if nid in _originals:
+        nid = node.name
+        # Persistent template wins over runtime backup
+        templates = scene.render_tokens_node_templates
+        tmpl = next((t for t in templates if t.node_name == node.name), None)
+        if tmpl:
+            _set_directory(node, tmpl.directory)
+            _set_file_name(node, tmpl.file_name)
+        elif nid in _originals:
             _set_directory(node, _originals[nid]["directory"])
             _set_file_name(node, _originals[nid]["file_name"])
+        if nid in _originals:
             orig_slots = _originals[nid].get("slots", {})
             for i, slot in enumerate(getattr(node, "file_slots", [])):
                 if i in orig_slots:
@@ -310,7 +369,7 @@ def _restore(scene):
 
 def _resolve_for_frame(scene, frame):
     for node in _output_file_nodes(scene):
-        nid = node.as_pointer()
+        nid = node.name
         if nid not in _originals:
             continue
         pass_name = _get_pass_name(node)
@@ -378,6 +437,8 @@ def _scene(args):
 @persistent
 def _on_render_init(*args):
     """Fires before animation render starts — before Blender caches compositor paths."""
+    global _is_animation_render
+    _is_animation_render = True
     s = _scene(args)
     if s:
         _backup_and_resolve(s)
@@ -398,21 +459,24 @@ def _on_render_write(*args):
 
 @persistent
 def _on_render_post(*args):
-    pass
+    """For single-frame renders, restore immediately after the frame is written."""
+    global _is_animation_render
+    if not _is_animation_render:
+        _restore()
 
 
 @persistent
 def _on_render_complete(*args):
-    s = _scene(args)
-    if s:
-        _restore(s)
+    global _is_animation_render
+    _is_animation_render = False
+    _restore()
 
 
 @persistent
 def _on_render_cancel(*args):
-    s = _scene(args)
-    if s:
-        _restore(s)
+    global _is_animation_render
+    _is_animation_render = False
+    _restore()
 
 
 _DEFAULT_RENDER_OUTPUT = "//Export/$prj/$version/$camera/PNG/$camera_$version_PNG_####"
@@ -429,6 +493,7 @@ def _on_load_post(*args):
             _ensure_presets_initialized(scene)
             if scene.render.filepath in _BLENDER_DEFAULT_OUTPUTS:
                 scene.render.filepath = _DEFAULT_RENDER_OUTPUT
+            _save_token_templates(scene)
     except Exception:
         pass
 
@@ -474,7 +539,7 @@ def _ensure_presets_initialized(scene):
 
 TOKEN_GROUPS = [
     ("Project", [
-        "$prj", "$camera", "$viewlayer", "$take", "$pass",
+        "$prj", "$camera", "$viewlayer", "$scene", "$pass",
         "$frame", "$res", "$range", "$fps", "$version",
     ]),
     ("Date / Time", [
@@ -489,7 +554,7 @@ TOKEN_DESCRIPTIONS = {
     "$prj":        "Project filename (no extension)",
     "$camera":     "Active camera name",
     "$viewlayer":  "Active view layer name",
-    "$take":       "Scene name",
+    "$scene":       "Active scene name",
     "$pass":       "First render pass input name",
     "$frame":      "Current frame, zero-padded (0001)",
     "$res":        "Resolution  e.g. 1920x1080",
@@ -520,7 +585,7 @@ _ALIASABLE_TOKENS = [
     ("$prj",       "Project filename (no extension)"),
     ("$camera",    "Active camera name"),
     ("$viewlayer", "Active view layer name"),
-    ("$take",      "Scene name"),
+    ("$scene",      "Scene name"),
     ("$pass",   "Render pass input name"),
     ("$frame",  "Current frame, zero-padded (0001)"),
     ("$res",    "Resolution e.g. 1920x1080"),
@@ -585,6 +650,13 @@ class TokenPreset(bpy.types.PropertyGroup):
     name:      StringProperty(name="Name",      default="New Preset")
     directory: StringProperty(name="Directory", default="//Export/$prj/$camera/")
     file_name: StringProperty(name="File Name", default="$camera_$res_####")
+
+
+class NodeTemplate(bpy.types.PropertyGroup):
+    """Persistent storage for a node's original token-based paths."""
+    node_name: StringProperty()
+    directory:  StringProperty()
+    file_name:  StringProperty()
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -787,6 +859,7 @@ class TOKENS_OT_quick_apply(bpy.types.Operator):
         _set_file_name(node, preset.file_name)
         node.name = "File Output"
         node.label = f"View Layer {preset.name}"
+        _save_token_templates(context.scene)
         return {"FINISHED"}
 
 
@@ -935,6 +1008,7 @@ class TOKENS_OT_apply_preset(bpy.types.Operator):
         _set_file_name(node, preset.file_name)
         node.name = "File Output"
         node.label = f"View Layer {preset.name}"
+        _save_token_templates(context.scene)
         return {"FINISHED"}
 
 
@@ -1134,7 +1208,7 @@ class TOKENS_PT_output_props(bpy.types.Panel):
     bl_space_type  = "PROPERTIES"
     bl_region_type = "WINDOW"
     bl_context     = "output"
-    bl_order       = 0
+    bl_order       = -3
 
     def draw(self, context):
         layout = self.layout
@@ -1162,6 +1236,7 @@ class TOKENS_PT_output_props(bpy.types.Panel):
 
 
 CLASSES = [
+    NodeTemplate,
     TokenAlias,
     TokenPreset,
     TOKENS_OT_update,
@@ -1200,6 +1275,8 @@ _SCENE_PROPS = [
     ("render_tokens_version",      IntProperty(name="$version", default=1, min=1, soft_max=999, update=_tag_redraw_all)),
     ("render_tokens_dir_template",        bpy.props.StringProperty(name="Directory", default="//Export/$prj/$version/$camera/")),
     ("render_tokens_file_template",       bpy.props.StringProperty(name="File Name", default="$camera_$pass_####")),
+    ("render_tokens_filepath_template",   bpy.props.StringProperty()),
+    ("render_tokens_node_templates",      CollectionProperty(type=NodeTemplate)),
 ]
 
 
