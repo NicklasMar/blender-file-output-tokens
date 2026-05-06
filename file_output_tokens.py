@@ -15,7 +15,7 @@
 bl_info = {
     "name": "File Output Render Tokens",
     "author": "Nicklas.mar",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (3, 0, 0),
     "location": "Compositor > Sidebar > Render Tokens | Properties > Output",
     "description": "Render tokens for File Output nodes and the render filepath",
@@ -178,24 +178,27 @@ def _get_compositor_trees(scene):
     trees = []
 
     def _add(tree):
-        if tree and id(tree) not in seen:
-            seen.add(id(tree))
-            trees.append(tree)
+        if tree:
+            ptr = tree.as_pointer()
+            if ptr not in seen:
+                seen.add(ptr)
+                trees.append(tree)
 
     _add(getattr(scene, "compositing_node_group", None))
     _add(getattr(scene, "node_tree", None))
-    for ng in bpy.data.node_groups:
-        if getattr(ng, "type", "") == "COMPOSITING":
-            _add(ng)
 
     return trees
 
 
 def _output_file_nodes(scene):
+    seen = set()
     for tree in _get_compositor_trees(scene):
         for node in tree.nodes:
             if node.type == "OUTPUT_FILE" and not node.mute:
-                yield node
+                ptr = node.as_pointer()
+                if ptr not in seen:
+                    seen.add(ptr)
+                    yield node
 
 
 def _get_directory(node):
@@ -238,6 +241,25 @@ def _get_pass_name(node):
     return ""
 
 
+def _find_source_scene(node, fallback_scene, _visited=None):
+    """Walk upstream links to find the Render Layers node and return its scene."""
+    if _visited is None:
+        _visited = set()
+    ptr = node.as_pointer()
+    if ptr in _visited:
+        return fallback_scene
+    _visited.add(ptr)
+    if node.type == "R_LAYERS":
+        src_scene = getattr(node, "scene", None)
+        return src_scene if src_scene else fallback_scene
+    for inp in getattr(node, "inputs", []):
+        for link in getattr(inp, "links", []):
+            result = _find_source_scene(link.from_node, fallback_scene, _visited)
+            if result is not fallback_scene:
+                return result
+    return fallback_scene
+
+
 def _expand_hashes(template, frame):
     return re.sub(r"#+", lambda m: str(frame).zfill(len(m.group())), template)
 
@@ -261,6 +283,8 @@ def _save_token_templates(scene):
     fp = scene.render.filepath
     if "$" in fp:
         scene.render_tokens_filepath_template = fp
+    else:
+        scene.render_tokens_filepath_template = ""
 
     for node in _output_file_nodes(scene):
         d  = _get_directory(node)
@@ -282,11 +306,13 @@ def _backup_and_resolve(scene):
     _backup_scene_name = scene.name
     frame = scene.frame_current
 
-    # Regular render filepath — persisted template is always authoritative.
-    # Never trust the live filepath here: a third-party addon (e.g. CamOps) may
-    # have already replaced it (possibly still containing $ from co_render_path).
-    stored_fp = getattr(scene, "render_tokens_filepath_template", "")
-    orig_fp = stored_fp if stored_fp else scene.render.filepath
+    # Use live filepath as source of truth. If it contains tokens, keep template
+    # in sync. If not (user deliberately set a plain path), clear stale template.
+    orig_fp = scene.render.filepath
+    if "$" in orig_fp:
+        scene.render_tokens_filepath_template = orig_fp
+    else:
+        scene.render_tokens_filepath_template = ""
     _originals["__filepath__"] = orig_fp
     scene.render.filepath = resolve_tokens(orig_fp, scene, "", frame)
     _log(f"render_pre — filepath resolved")
@@ -294,31 +320,33 @@ def _backup_and_resolve(scene):
     nodes = list(_output_file_nodes(scene))
     _log(f"render_pre — {len(nodes)} File Output node(s), frame {frame}")
 
+    _name_counts = {}
     for node in nodes:
-        nid = node.name
+        n = node.name
+        _name_counts[n] = _name_counts.get(n, 0) + 1
+        nid = (n, _name_counts[n])
 
-        # Persisted template is authoritative — use it when available.
-        # This handles the case where a third-party addon overwrote node paths
-        # (even if the overwritten path still contains $ from the custom root).
+        # Use live node paths as source of truth — sync template to match.
+        orig_dir = _get_directory(node)
+        orig_fn  = _get_file_name(node)
         templates = scene.render_tokens_node_templates
         tmpl = next((t for t in templates if t.node_name == node.name), None)
         if tmpl:
-            orig_dir = tmpl.directory
-            orig_fn  = tmpl.file_name
-            _log(f"  '{node.name}': using persisted template")
-        else:
-            orig_dir = _get_directory(node)
-            orig_fn  = _get_file_name(node)
+            tmpl.directory = orig_dir
+            tmpl.file_name = orig_fn
+
+        # Resolve tokens using the scene referenced by the connected Render Layer node.
+        node_scene = _find_source_scene(node, scene)
 
         # Backup slot paths (each input slot has its own file subpath)
         orig_slots = {i: slot.path for i, slot in enumerate(getattr(node, "file_slots", []))}
 
-        _originals[nid] = {"directory": orig_dir, "file_name": orig_fn, "slots": orig_slots}
+        _originals[nid] = {"directory": orig_dir, "file_name": orig_fn, "slots": orig_slots, "scene": node_scene.name}
 
         pass_name = _get_pass_name(node)
-        # Resolve tokens but keep the // prefix — Blender needs its own relative paths
-        new_dir = resolve_tokens(orig_dir, scene, pass_name, frame)
-        new_fn = resolve_tokens(orig_fn, scene, pass_name, frame)
+        # Resolve tokens using the scene from the connected Render Layer node
+        new_dir = resolve_tokens(orig_dir, node_scene, pass_name, frame)
+        new_fn = resolve_tokens(orig_fn, node_scene, pass_name, frame)
 
         _set_directory(node, new_dir)
         _set_file_name(node, new_fn)
@@ -340,22 +368,16 @@ def _restore(scene=None):
     if scene is None:
         _originals.clear()
         return
-    # Render filepath: persistent template wins, _originals as fallback
-    fp_tmpl = getattr(scene, "render_tokens_filepath_template", "")
-    if fp_tmpl:
-        scene.render.filepath = fp_tmpl
-    elif "__filepath__" in _originals:
+    # Render filepath: always restore from backup (avoids stale template override)
+    if "__filepath__" in _originals:
         scene.render.filepath = _originals["__filepath__"]
 
+    _name_counts = {}
     for node in _output_file_nodes(scene):
-        nid = node.name
-        # Persistent template wins over runtime backup
-        templates = scene.render_tokens_node_templates
-        tmpl = next((t for t in templates if t.node_name == node.name), None)
-        if tmpl:
-            _set_directory(node, tmpl.directory)
-            _set_file_name(node, tmpl.file_name)
-        elif nid in _originals:
+        n = node.name
+        _name_counts[n] = _name_counts.get(n, 0) + 1
+        nid = (n, _name_counts[n])
+        if nid in _originals:
             _set_directory(node, _originals[nid]["directory"])
             _set_file_name(node, _originals[nid]["file_name"])
         if nid in _originals:
@@ -368,13 +390,18 @@ def _restore(scene=None):
 
 
 def _resolve_for_frame(scene, frame):
+    _name_counts = {}
     for node in _output_file_nodes(scene):
-        nid = node.name
+        n = node.name
+        _name_counts[n] = _name_counts.get(n, 0) + 1
+        nid = (n, _name_counts[n])
         if nid not in _originals:
             continue
         pass_name = _get_pass_name(node)
-        new_dir = resolve_tokens(_originals[nid]["directory"], scene, pass_name, frame)
-        new_fn = resolve_tokens(_originals[nid]["file_name"], scene, pass_name, frame)
+        node_scene_name = _originals[nid].get("scene", scene.name)
+        node_scene = bpy.data.scenes.get(node_scene_name) or scene
+        new_dir = resolve_tokens(_originals[nid]["directory"], node_scene, pass_name, frame)
+        new_fn = resolve_tokens(_originals[nid]["file_name"], node_scene, pass_name, frame)
         _set_directory(node, new_dir)
         _set_file_name(node, new_fn)
         abs_dir = _to_absolute(new_dir)
@@ -446,10 +473,14 @@ def _on_render_init(*args):
 
 @persistent
 def _on_render_pre(*args):
-    """Single-frame fallback: only resolves if render_init didn't already run."""
+    """Single-frame fallback or per-frame camera update for animations."""
     s = _scene(args)
-    if s and not _originals:
+    if not s:
+        return
+    if not _originals:
         _backup_and_resolve(s)
+    elif _is_animation_render:
+        _resolve_for_frame(s, s.frame_current)
 
 
 @persistent
@@ -479,20 +510,13 @@ def _on_render_cancel(*args):
     _restore()
 
 
-_DEFAULT_RENDER_OUTPUT = "//Export/$prj/$version/$camera/PNG/$camera_$version_PNG_####"
-
-# Blender's built-in default render filepaths (platform-dependent)
-_BLENDER_DEFAULT_OUTPUTS = {"//", "/tmp\\", "/tmp/"}
 
 
 @persistent
 def _on_load_post(*args):
     try:
-        scene = bpy.context.scene
-        if scene:
+        for scene in bpy.data.scenes:
             _ensure_presets_initialized(scene)
-            if scene.render.filepath in _BLENDER_DEFAULT_OUTPUTS:
-                scene.render.filepath = _DEFAULT_RENDER_OUTPUT
             _save_token_templates(scene)
     except Exception:
         pass
@@ -1305,13 +1329,11 @@ def register():
         try:
             scene = bpy.context.scene if bpy.context else None
             _ensure_presets_initialized(scene)
-            if scene and scene.render.filepath in _BLENDER_DEFAULT_OUTPUTS:
-                scene.render.filepath = _DEFAULT_RENDER_OUTPUT
         except Exception:
             pass
         return None  # do not repeat
     bpy.app.timers.register(_delayed_preset_init, first_interval=0.1)
-    _log("v1.0.0 registered")
+    _log("v1.0.1 registered")
 
 
 def unregister():
@@ -1334,7 +1356,7 @@ def unregister():
             delattr(bpy.types.Scene, name)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
-    _log("v1.0.0 unregistered")
+    _log("v1.0.1 unregistered")
 
 
 if __name__ == "__main__":
