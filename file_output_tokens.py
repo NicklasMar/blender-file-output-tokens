@@ -15,10 +15,10 @@
 bl_info = {
     "name": "File Output Render Tokens",
     "author": "Nicklas.mar",
-    "version": (1, 0, 1),
+    "version": (1, 0, 2),
     "blender": (3, 0, 0),
     "location": "Compositor > Sidebar > Render Tokens | Properties > Output",
-    "description": "Render tokens for File Output nodes and the render filepath",
+    "description": "Render tokens for File Output nodes and the render filepath, with optional Compositor Guard",
     "category": "Compositing",
     "doc_url": "https://github.com/NicklasMar/blender-file-output-tokens",
 }
@@ -54,7 +54,7 @@ def _log(msg):
 # Token Resolution
 # ─────────────────────────────────────────────────────────────────
 
-def resolve_tokens(path, scene, pass_name="", frame=None):
+def resolve_tokens(path, scene, pass_name="", frame=None, viewlayer_name=None):
     now = datetime.datetime.now()
     render = scene.render
 
@@ -64,7 +64,8 @@ def resolve_tokens(path, scene, pass_name="", frame=None):
     blend = bpy.data.filepath
     prj = os.path.splitext(os.path.basename(blend))[0] if blend else "untitled"
     camera_raw = scene.camera.name if scene.camera else "no_camera"
-    camera = camera_raw[:-4] if camera_raw.endswith("_CAM") else camera_raw
+    _ck = scene.camera.get("ck_shot_name") if scene.camera else None
+    camera = _ck if _ck else (camera_raw[:-4] if camera_raw.endswith("_CAM") else camera_raw)
 
     version = str(getattr(scene, "render_tokens_version", 1)).zfill(3)
 
@@ -86,10 +87,13 @@ def resolve_tokens(path, scene, pass_name="", frame=None):
     }
     engine_display = _ENGINE_NAMES.get(render.engine, render.engine)
 
-    try:
-        viewlayer = context.view_layer.name if (context := bpy.context) else scene.view_layers[0].name
-    except Exception:
-        viewlayer = scene.view_layers[0].name if scene.view_layers else ""
+    if viewlayer_name:
+        viewlayer = viewlayer_name
+    else:
+        try:
+            viewlayer = context.view_layer.name if (context := bpy.context) else scene.view_layers[0].name
+        except Exception:
+            viewlayer = scene.view_layers[0].name if scene.view_layers else ""
 
     # Build a mapping: default_name -> active token string (custom or default).
     # _active_token_name() reads addon preferences; falls back silently.
@@ -260,6 +264,24 @@ def _find_source_scene(node, fallback_scene, _visited=None):
     return fallback_scene
 
 
+def _find_source_viewlayer(node, fallback_scene, _visited=None):
+    """Walk upstream links to find the Render Layers node and return its view layer name."""
+    if _visited is None:
+        _visited = set()
+    ptr = node.as_pointer()
+    if ptr in _visited:
+        return None
+    _visited.add(ptr)
+    if node.type == "R_LAYERS":
+        return getattr(node, "layer", None)
+    for inp in getattr(node, "inputs", []):
+        for link in getattr(inp, "links", []):
+            result = _find_source_viewlayer(link.from_node, fallback_scene, _visited)
+            if result:
+                return result
+    return None
+
+
 def _expand_hashes(template, frame):
     return re.sub(r"#+", lambda m: str(frame).zfill(len(m.group())), template)
 
@@ -271,6 +293,87 @@ def _expand_hashes(template, frame):
 _originals = {}
 _backup_scene_name = None
 _is_animation_render = False
+_msgbus_owner = object()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Compositor Guard
+# ─────────────────────────────────────────────────────────────────
+
+_dirty_dirs = {}        # folder -> retry_count
+_CG_MAX_RETRIES = 5
+
+
+def _compositor_guard_enabled():
+    try:
+        prefs = bpy.context.preferences.addons[__name__].preferences
+        return bool(getattr(prefs, "compositor_guard_enabled", False))
+    except Exception:
+        return False
+
+
+def _should_guard(scene):
+    return (
+        _compositor_guard_enabled()
+        and scene.render.use_compositing
+        and not scene.render.use_sequencer
+    )
+
+
+def _cg_remove_empty_parents(folder, max_levels=10):
+    current = folder
+    for _ in range(max_levels):
+        if not os.path.isdir(current):
+            current = os.path.dirname(current)
+            continue
+        try:
+            os.rmdir(current)
+            _log(f"Compositor Guard removed folder: {current}")
+            current = os.path.dirname(current)
+        except OSError:
+            break
+
+
+def _cg_cleanup_dirs_timer():
+    still_pending = {}
+    for folder, attempts in list(_dirty_dirs.items()):
+        if not os.path.isdir(folder):
+            continue
+        try:
+            os.rmdir(folder)
+            _log(f"Compositor Guard removed folder: {folder}")
+            _cg_remove_empty_parents(os.path.dirname(folder))
+        except OSError as e:
+            if attempts < _CG_MAX_RETRIES:
+                still_pending[folder] = attempts + 1
+                _log(f"Compositor Guard retry {attempts+1}/{_CG_MAX_RETRIES}: {folder} ({e})")
+            else:
+                _log(f"Compositor Guard gave up after {_CG_MAX_RETRIES} attempts: {folder} ({e})")
+    _dirty_dirs.clear()
+    if still_pending:
+        _dirty_dirs.update(still_pending)
+        return 1.0
+    return None
+
+
+def _on_filepath_change():
+    """Called by msgbus whenever scene.render.filepath changes in the UI."""
+    try:
+        for scene in bpy.data.scenes:
+            fp = scene.render.filepath
+            if "$" in fp:
+                scene.render_tokens_filepath_template = fp
+    except Exception:
+        pass
+
+
+def _subscribe_filepath():
+    bpy.msgbus.subscribe_rna(
+        key=(bpy.types.RenderSettings, "filepath"),
+        owner=_msgbus_owner,
+        args=(),
+        notify=_on_filepath_change,
+    )
 
 
 def _save_token_templates(scene):
@@ -306,9 +409,12 @@ def _backup_and_resolve(scene):
     _backup_scene_name = scene.name
     frame = scene.frame_current
 
-    # Use live filepath as source of truth. If it contains tokens, keep template
-    # in sync. If not (user deliberately set a plain path), clear stale template.
     orig_fp = scene.render.filepath
+    # If another addon pre-resolved our tokens before render_init fires (e.g. CamOps),
+    # the live filepath has no "$" but the saved template still does — use the template.
+    tmpl = getattr(scene, "render_tokens_filepath_template", "")
+    if "$" not in orig_fp and tmpl and "$" in tmpl:
+        orig_fp = tmpl
     if "$" in orig_fp:
         scene.render_tokens_filepath_template = orig_fp
     else:
@@ -335,18 +441,20 @@ def _backup_and_resolve(scene):
             tmpl.directory = orig_dir
             tmpl.file_name = orig_fn
 
-        # Resolve tokens using the scene referenced by the connected Render Layer node.
+        # Resolve tokens using the scene/view layer referenced by the connected Render Layer node.
         node_scene = _find_source_scene(node, scene)
+        node_viewlayer = _find_source_viewlayer(node, scene)
 
         # Backup slot paths (each input slot has its own file subpath)
         orig_slots = {i: slot.path for i, slot in enumerate(getattr(node, "file_slots", []))}
 
-        _originals[nid] = {"directory": orig_dir, "file_name": orig_fn, "slots": orig_slots, "scene": node_scene.name}
+        _originals[nid] = {"directory": orig_dir, "file_name": orig_fn, "slots": orig_slots,
+                            "scene": node_scene.name, "viewlayer": node_viewlayer}
 
         pass_name = _get_pass_name(node)
-        # Resolve tokens using the scene from the connected Render Layer node
-        new_dir = resolve_tokens(orig_dir, node_scene, pass_name, frame)
-        new_fn = resolve_tokens(orig_fn, node_scene, pass_name, frame)
+        # Resolve tokens using the scene/view layer from the connected Render Layer node
+        new_dir = resolve_tokens(orig_dir, node_scene, pass_name, frame, node_viewlayer)
+        new_fn = resolve_tokens(orig_fn, node_scene, pass_name, frame, node_viewlayer)
 
         _set_directory(node, new_dir)
         _set_file_name(node, new_fn)
@@ -400,8 +508,9 @@ def _resolve_for_frame(scene, frame):
         pass_name = _get_pass_name(node)
         node_scene_name = _originals[nid].get("scene", scene.name)
         node_scene = bpy.data.scenes.get(node_scene_name) or scene
-        new_dir = resolve_tokens(_originals[nid]["directory"], node_scene, pass_name, frame)
-        new_fn = resolve_tokens(_originals[nid]["file_name"], node_scene, pass_name, frame)
+        node_viewlayer = _originals[nid].get("viewlayer")
+        new_dir = resolve_tokens(_originals[nid]["directory"], node_scene, pass_name, frame, node_viewlayer)
+        new_fn = resolve_tokens(_originals[nid]["file_name"], node_scene, pass_name, frame, node_viewlayer)
         _set_directory(node, new_dir)
         _set_file_name(node, new_fn)
         abs_dir = _to_absolute(new_dir)
@@ -467,7 +576,7 @@ def _on_render_init(*args):
     global _is_animation_render
     _is_animation_render = True
     s = _scene(args)
-    if s:
+    if s and not _originals:
         _backup_and_resolve(s)
 
 
@@ -485,7 +594,18 @@ def _on_render_pre(*args):
 
 @persistent
 def _on_render_write(*args):
-    pass
+    s = _scene(args)
+    if not s or not _should_guard(s):
+        return
+    try:
+        filepath = s.render.frame_path(frame=s.frame_current)
+        abs_path = bpy.path.abspath(filepath)
+        if os.path.isfile(abs_path):
+            os.remove(abs_path)
+            _log(f"Compositor Guard removed file: {abs_path}")
+            _dirty_dirs[os.path.dirname(abs_path)] = 0
+    except Exception as e:
+        _log(f"Compositor Guard write-cleanup failed: {e}")
 
 
 @persistent
@@ -501,6 +621,8 @@ def _on_render_complete(*args):
     global _is_animation_render
     _is_animation_render = False
     _restore()
+    if _dirty_dirs:
+        bpy.app.timers.register(_cg_cleanup_dirs_timer, first_interval=0.5)
 
 
 @persistent
@@ -508,6 +630,8 @@ def _on_render_cancel(*args):
     global _is_animation_render
     _is_animation_render = False
     _restore()
+    if _dirty_dirs:
+        bpy.app.timers.register(_cg_cleanup_dirs_timer, first_interval=0.5)
 
 
 
@@ -807,10 +931,36 @@ class TOKENS_Preferences(bpy.types.AddonPreferences):
     )
     token_aliases: CollectionProperty(type=TokenAlias)
 
+    compositor_guard_enabled: BoolProperty(
+        name="Compositor Guard",
+        default=False,
+        description=(
+            "Delete the default render output file when only Compositing is "
+            "enabled (Sequencer off) in Post Processing. Empty folders are "
+            "cleaned up after the render finishes. Tokens in the filepath "
+            "are still restored after render."
+        ),
+    )
+
     def draw(self, context):
         layout = self.layout
 
         layout.operator("render_tokens.update", icon="FILE_REFRESH")
+        layout.separator(factor=0.5)
+
+        # ── Compositor Guard ──────────────────────────────────────
+        cg_row = layout.row()
+        cg_row.scale_y = 1.2
+        cg_row.prop(
+            self, "compositor_guard_enabled",
+            toggle=True,
+            icon="LOCKED" if self.compositor_guard_enabled else "UNLOCKED",
+        )
+        if self.compositor_guard_enabled:
+            cg_box = layout.box()
+            cg_col = cg_box.column(align=True)
+            cg_col.label(text="Active when Compositing is ON and Sequencer is OFF.", icon="INFO")
+            cg_col.label(text="Default output file is removed every frame; empty folders cleaned up after render.")
 
         layout.separator(factor=0.5)
 
@@ -1190,7 +1340,6 @@ class TOKENS_PT_presets(bpy.types.Panel):
 
 
 
-
 # ─────────────────────────────────────────────────────────────────
 # Registration
 # ─────────────────────────────────────────────────────────────────
@@ -1333,7 +1482,8 @@ def register():
             pass
         return None  # do not repeat
     bpy.app.timers.register(_delayed_preset_init, first_interval=0.1)
-    _log("v1.0.1 registered")
+    bpy.app.timers.register(_subscribe_filepath, first_interval=0.2)
+    _log("v1.0.2 registered")
 
 
 def unregister():
@@ -1348,6 +1498,7 @@ def unregister():
         handlers.append((_on_render_init,     bpy.app.handlers.render_init))
     if hasattr(bpy.app.handlers, "render_complete"):
         handlers.append((_on_render_complete, bpy.app.handlers.render_complete))
+    bpy.msgbus.clear_by_owner(_msgbus_owner)
     for h, lst in handlers:
         if h in lst:
             lst.remove(h)
@@ -1356,7 +1507,7 @@ def unregister():
             delattr(bpy.types.Scene, name)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
-    _log("v1.0.1 unregistered")
+    _log("v1.0.2 unregistered")
 
 
 if __name__ == "__main__":
