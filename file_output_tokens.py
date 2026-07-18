@@ -1532,7 +1532,6 @@ def unregister():
     _unregister_playblast_integration()
     handlers = [
         (_on_render_pre,    bpy.app.handlers.render_pre),
-        (_on_render_write,  bpy.app.handlers.render_write),
         (_on_render_post,   bpy.app.handlers.render_post),
         (_on_render_cancel, bpy.app.handlers.render_cancel),
         (_on_load_post,     bpy.app.handlers.load_post),
