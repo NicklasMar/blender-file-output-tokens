@@ -15,10 +15,10 @@
 bl_info = {
     "name": "File Output Render Tokens",
     "author": "Nicklas.mar",
-    "version": (1, 0, 2),
+    "version": (1, 0, 6),
     "blender": (3, 0, 0),
     "location": "Compositor > Sidebar > Render Tokens | Properties > Output",
-    "description": "Render tokens for File Output nodes and the render filepath, with optional Compositor Guard",
+    "description": "Render tokens for File Output nodes and the render filepath, with optional Compositor Guard. Tested on Blender 5.2.",
     "category": "Compositing",
     "doc_url": "https://github.com/NicklasMar/blender-file-output-tokens",
 }
@@ -188,8 +188,14 @@ def _get_compositor_trees(scene):
                 seen.add(ptr)
                 trees.append(tree)
 
-    _add(getattr(scene, "compositing_node_group", None))
+    # Blender 3.x/4.x: scene.node_tree — Blender 5.0/5.1: scene.compositing_node_group
+    # Blender 5.2+: scene.compositor.node_tree (compositor settings moved into their
+    # own struct). Check all three so this works across versions.
     _add(getattr(scene, "node_tree", None))
+    _add(getattr(scene, "compositing_node_group", None))
+    compositor = getattr(scene, "compositor", None)
+    if compositor is not None:
+        _add(getattr(compositor, "node_tree", None))
 
     return trees
 
@@ -448,8 +454,26 @@ def _backup_and_resolve(scene):
         # Backup slot paths (each input slot has its own file subpath)
         orig_slots = {i: slot.path for i, slot in enumerate(getattr(node, "file_slots", []))}
 
+        # Blender 5.2+ File Output redesign: a single-item, non-multilayer node
+        # appends its one item's .name after the resolved filename (e.g.
+        # "cam_0095_Image.jpg") — since file_name already fully describes that
+        # output, blank it for the duration of the render so nothing gets
+        # appended. With multiple items (AOVs, Cryptomatte passes, ...) or a
+        # Multi-Layer EXR container, item.name is the actual internal layer
+        # name — blanking it there would corrupt the file (Cryptomatte layers
+        # losing their names, e.g. "CryptoObject00" -> unnamed "_001"), so
+        # leave those untouched.
+        file_output_items = list(getattr(node, "file_output_items", []))
+        is_multilayer = getattr(node.format, "file_format", "") == "OPEN_EXR_MULTILAYER"
+        if len(file_output_items) == 1 and not is_multilayer:
+            orig_item_names = {0: file_output_items[0].name}
+            file_output_items[0].name = ""
+        else:
+            orig_item_names = {}
+
         _originals[nid] = {"directory": orig_dir, "file_name": orig_fn, "slots": orig_slots,
-                            "scene": node_scene.name, "viewlayer": node_viewlayer}
+                            "scene": node_scene.name, "viewlayer": node_viewlayer,
+                            "item_names": orig_item_names}
 
         pass_name = _get_pass_name(node)
         # Resolve tokens using the scene/view layer from the connected Render Layer node
@@ -493,6 +517,10 @@ def _restore(scene=None):
             for i, slot in enumerate(getattr(node, "file_slots", [])):
                 if i in orig_slots:
                     slot.path = orig_slots[i]
+            orig_item_names = _originals[nid].get("item_names", {})
+            for i, item in enumerate(getattr(node, "file_output_items", [])):
+                if i in orig_item_names:
+                    item.name = orig_item_names[i]
     _originals.clear()
     _log("Paths restored.")
 
@@ -634,6 +662,122 @@ def _on_render_cancel(*args):
         bpy.app.timers.register(_cg_cleanup_dirs_timer, first_interval=0.5)
 
 
+
+
+# ─────────────────────────────────────────────────────────────────
+# CamOps Playblast Integration (optional — no-op if CamOps isn't installed)
+# ─────────────────────────────────────────────────────────────────
+#
+# CamOps' Playblast uses bpy.ops.render.opengl(), which does not reliably fire
+# Blender's standard render_init/render_pre handlers the way a normal render
+# does — so our token resolution never runs before the OpenGL render starts,
+# and scene.render.filepath gets written with the literal token text (e.g.
+# "$camera_0075.png"). We patch CamOps' playblast operator directly so each
+# shot's scene.render.filepath tokens get resolved right before its OpenGL
+# render starts, and restored right after — driven by CamOps' own per-shot
+# lifecycle instead of Blender's render handlers.
+#
+# Deliberately does NOT touch compositor File Output nodes: playblast should
+# only ever write its own PNG sequence via scene.render.filepath, never create
+# the folders belonging to actual (internal/external) renders' File Output
+# nodes.
+#
+# Blender 5.2+ also added scene.render.save_output ("write frames to disk for
+# animation renders"); if the user has it turned off (relying on File Output
+# nodes only), bpy.ops.render.opengl(animation=True) won't write anything
+# either. We flip it on for the duration of the playblast batch and restore
+# it afterward.
+
+_playblast_patched_engine_cls = None
+_playblast_originals = {"invoke": None, "start_job": None, "finish": None}
+_playblast_saved_save_output = {}
+_playblast_filepath_backup = {}
+
+
+def _playblast_backup_and_resolve_filepath(scene):
+    """Resolve tokens in scene.render.filepath only — playblast doesn't touch
+    compositor File Output nodes (no folders should get created for those)."""
+    orig_fp = scene.render.filepath
+    _playblast_filepath_backup["value"] = orig_fp
+    scene.render.filepath = resolve_tokens(orig_fp, scene, "", scene.frame_current)
+
+
+def _playblast_restore_filepath(scene):
+    if "value" in _playblast_filepath_backup:
+        scene.render.filepath = _playblast_filepath_backup.pop("value")
+
+
+def _playblast_patched_invoke(self, context, event):
+    scene = context.scene
+    if hasattr(scene.render, "save_output"):
+        _playblast_saved_save_output["value"] = scene.render.save_output
+        scene.render.save_output = True
+    return _playblast_originals["invoke"](self, context, event)
+
+
+def _playblast_patched_start_job(self, context):
+    scene = context.scene
+    if _playblast_filepath_backup:
+        # leftover resolved filepath from the previous shot in this batch
+        _playblast_restore_filepath(scene)
+    _playblast_backup_and_resolve_filepath(scene)
+    return _playblast_originals["start_job"](self, context)
+
+
+def _playblast_patched_finish(self, context, msg):
+    if _playblast_filepath_backup:
+        _playblast_restore_filepath(context.scene)
+    if "value" in _playblast_saved_save_output and hasattr(context.scene.render, "save_output"):
+        context.scene.render.save_output = _playblast_saved_save_output.pop("value")
+    return _playblast_originals["finish"](self, context, msg)
+
+
+_playblast_timer_active = False
+
+
+def _register_camops_playblast_integration():
+    """(Re-)patch CamOps' playblast operator. Safe to call repeatedly — CamOps'
+    own dev-mode hot-reload (Reload Scripts / addon toggle) replaces its module's
+    classes with fresh, unpatched ones, silently undoing our patch. A periodic
+    timer calls this again so the integration heals itself instead of quietly
+    going stale."""
+    global _playblast_patched_engine_cls
+    try:
+        import camops.operators.ops_playblast as _co_playblast
+    except ImportError:
+        return
+    cls = _co_playblast.CO_OT_PlayblastEngine
+    if getattr(cls.invoke, "__module__", "") == __name__:
+        # already patched and still ours — nothing to do
+        _playblast_patched_engine_cls = cls
+        return
+    _playblast_originals["invoke"] = cls.invoke
+    _playblast_originals["start_job"] = cls.start_job
+    _playblast_originals["finish"] = cls.finish
+    cls.invoke = _playblast_patched_invoke
+    cls.start_job = _playblast_patched_start_job
+    cls.finish = _playblast_patched_finish
+    _playblast_patched_engine_cls = cls
+    _log("CamOps Playblast integration active")
+
+
+def _playblast_integrity_timer():
+    _register_camops_playblast_integration()
+    return 2.0  # keep checking every 2s in case CamOps hot-reloads mid-session
+
+
+def _unregister_camops_playblast_integration():
+    global _playblast_patched_engine_cls
+    if _playblast_patched_engine_cls is None:
+        return
+    cls = _playblast_patched_engine_cls
+    if _playblast_originals["invoke"] is not None:
+        cls.invoke = _playblast_originals["invoke"]
+    if _playblast_originals["start_job"] is not None:
+        cls.start_job = _playblast_originals["start_job"]
+    if _playblast_originals["finish"] is not None:
+        cls.finish = _playblast_originals["finish"]
+    _playblast_patched_engine_cls = None
 
 
 @persistent
@@ -1483,10 +1627,16 @@ def register():
         return None  # do not repeat
     bpy.app.timers.register(_delayed_preset_init, first_interval=0.1)
     bpy.app.timers.register(_subscribe_filepath, first_interval=0.2)
-    _log("v1.0.2 registered")
+    _register_camops_playblast_integration()
+    if not bpy.app.timers.is_registered(_playblast_integrity_timer):
+        bpy.app.timers.register(_playblast_integrity_timer, first_interval=2.0)
+    _log("v1.0.6 registered")
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_playblast_integrity_timer):
+        bpy.app.timers.unregister(_playblast_integrity_timer)
+    _unregister_camops_playblast_integration()
     handlers = [
         (_on_render_pre,    bpy.app.handlers.render_pre),
         (_on_render_write,  bpy.app.handlers.render_write),
@@ -1507,7 +1657,7 @@ def unregister():
             delattr(bpy.types.Scene, name)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
-    _log("v1.0.2 unregistered")
+    _log("v1.0.6 unregistered")
 
 
 if __name__ == "__main__":
