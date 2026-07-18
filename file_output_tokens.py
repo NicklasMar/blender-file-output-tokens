@@ -15,7 +15,7 @@
 bl_info = {
     "name": "File Output Render Tokens",
     "author": "Nicklas.mar",
-    "version": (1, 0, 4),
+    "version": (1, 0, 3),
     "blender": (3, 0, 0),
     "location": "Compositor > Sidebar > Render Tokens | Properties > Output",
     "description": "Render tokens for File Output nodes and the render filepath. Tested on Blender 5.2.",
@@ -1523,7 +1523,7 @@ def register():
     _register_playblast_integration()
     if not bpy.app.timers.is_registered(_playblast_integrity_timer):
         bpy.app.timers.register(_playblast_integrity_timer, first_interval=2.0)
-    _log("v1.0.4 registered")
+    _log("v1.0.3 registered")
 
 
 def unregister():
@@ -1550,7 +1550,7 @@ def unregister():
             delattr(bpy.types.Scene, name)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
-    _log("v1.0.4 unregistered")
+    _log("v1.0.3 unregistered")
 
 
 if __name__ == "__main__":
