@@ -15,10 +15,10 @@
 bl_info = {
     "name": "File Output Render Tokens",
     "author": "Nicklas.mar",
-    "version": (1, 0, 3),
+    "version": (1, 0, 4),
     "blender": (3, 0, 0),
     "location": "Compositor > Sidebar > Render Tokens | Properties > Output",
-    "description": "Render tokens for File Output nodes and the render filepath, with optional Compositor Guard. Tested on Blender 5.2.",
+    "description": "Render tokens for File Output nodes and the render filepath. Tested on Blender 5.2.",
     "category": "Compositing",
     "doc_url": "https://github.com/NicklasMar/blender-file-output-tokens",
 }
@@ -302,65 +302,6 @@ _is_animation_render = False
 _msgbus_owner = object()
 
 
-# ─────────────────────────────────────────────────────────────────
-# Compositor Guard
-# ─────────────────────────────────────────────────────────────────
-
-_dirty_dirs = {}        # folder -> retry_count
-_CG_MAX_RETRIES = 5
-
-
-def _compositor_guard_enabled():
-    try:
-        prefs = bpy.context.preferences.addons[__name__].preferences
-        return bool(getattr(prefs, "compositor_guard_enabled", False))
-    except Exception:
-        return False
-
-
-def _should_guard(scene):
-    return (
-        _compositor_guard_enabled()
-        and scene.render.use_compositing
-        and not scene.render.use_sequencer
-    )
-
-
-def _cg_remove_empty_parents(folder, max_levels=10):
-    current = folder
-    for _ in range(max_levels):
-        if not os.path.isdir(current):
-            current = os.path.dirname(current)
-            continue
-        try:
-            os.rmdir(current)
-            _log(f"Compositor Guard removed folder: {current}")
-            current = os.path.dirname(current)
-        except OSError:
-            break
-
-
-def _cg_cleanup_dirs_timer():
-    still_pending = {}
-    for folder, attempts in list(_dirty_dirs.items()):
-        if not os.path.isdir(folder):
-            continue
-        try:
-            os.rmdir(folder)
-            _log(f"Compositor Guard removed folder: {folder}")
-            _cg_remove_empty_parents(os.path.dirname(folder))
-        except OSError as e:
-            if attempts < _CG_MAX_RETRIES:
-                still_pending[folder] = attempts + 1
-                _log(f"Compositor Guard retry {attempts+1}/{_CG_MAX_RETRIES}: {folder} ({e})")
-            else:
-                _log(f"Compositor Guard gave up after {_CG_MAX_RETRIES} attempts: {folder} ({e})")
-    _dirty_dirs.clear()
-    if still_pending:
-        _dirty_dirs.update(still_pending)
-        return 1.0
-    return None
-
 
 def _on_filepath_change():
     """Called by msgbus whenever scene.render.filepath changes in the UI."""
@@ -416,7 +357,7 @@ def _backup_and_resolve(scene):
     frame = scene.frame_current
 
     orig_fp = scene.render.filepath
-    # If another addon pre-resolved our tokens before render_init fires (e.g. CamOps),
+    # If another addon pre-resolved our tokens before render_init fires,
     # the live filepath has no "$" but the saved template still does — use the template.
     tmpl = getattr(scene, "render_tokens_filepath_template", "")
     if "$" not in orig_fp and tmpl and "$" in tmpl:
@@ -621,22 +562,6 @@ def _on_render_pre(*args):
 
 
 @persistent
-def _on_render_write(*args):
-    s = _scene(args)
-    if not s or not _should_guard(s):
-        return
-    try:
-        filepath = s.render.frame_path(frame=s.frame_current)
-        abs_path = bpy.path.abspath(filepath)
-        if os.path.isfile(abs_path):
-            os.remove(abs_path)
-            _log(f"Compositor Guard removed file: {abs_path}")
-            _dirty_dirs[os.path.dirname(abs_path)] = 0
-    except Exception as e:
-        _log(f"Compositor Guard write-cleanup failed: {e}")
-
-
-@persistent
 def _on_render_post(*args):
     """For single-frame renders, restore immediately after the frame is written."""
     global _is_animation_render
@@ -649,8 +574,6 @@ def _on_render_complete(*args):
     global _is_animation_render
     _is_animation_render = False
     _restore()
-    if _dirty_dirs:
-        bpy.app.timers.register(_cg_cleanup_dirs_timer, first_interval=0.5)
 
 
 @persistent
@@ -658,24 +581,22 @@ def _on_render_cancel(*args):
     global _is_animation_render
     _is_animation_render = False
     _restore()
-    if _dirty_dirs:
-        bpy.app.timers.register(_cg_cleanup_dirs_timer, first_interval=0.5)
 
 
 
 
 # ─────────────────────────────────────────────────────────────────
-# CamOps Playblast Integration (optional — no-op if CamOps isn't installed)
+# Third-Party Playblast Integration (optional — no-op if that addon isn't installed)
 # ─────────────────────────────────────────────────────────────────
 #
-# CamOps' Playblast uses bpy.ops.render.opengl(), which does not reliably fire
-# Blender's standard render_init/render_pre handlers the way a normal render
-# does — so our token resolution never runs before the OpenGL render starts,
-# and scene.render.filepath gets written with the literal token text (e.g.
-# "$camera_0075.png"). We patch CamOps' playblast operator directly so each
-# shot's scene.render.filepath tokens get resolved right before its OpenGL
-# render starts, and restored right after — driven by CamOps' own per-shot
-# lifecycle instead of Blender's render handlers.
+# Some pipeline addons drive quick preview renders via bpy.ops.render.opengl(),
+# which does not reliably fire Blender's standard render_init/render_pre
+# handlers the way a normal render does — so our token resolution never runs
+# before the OpenGL render starts, and scene.render.filepath gets written with
+# the literal token text (e.g. "$camera_0075.png"). We patch that addon's
+# playblast operator directly so each shot's scene.render.filepath tokens get
+# resolved right before its OpenGL render starts, and restored right after —
+# driven by its own per-shot lifecycle instead of Blender's render handlers.
 #
 # Deliberately does NOT touch compositor File Output nodes: playblast should
 # only ever write its own PNG sequence via scene.render.filepath, never create
@@ -735,12 +656,12 @@ def _playblast_patched_finish(self, context, msg):
 _playblast_timer_active = False
 
 
-def _register_camops_playblast_integration():
-    """(Re-)patch CamOps' playblast operator. Safe to call repeatedly — CamOps'
-    own dev-mode hot-reload (Reload Scripts / addon toggle) replaces its module's
-    classes with fresh, unpatched ones, silently undoing our patch. A periodic
-    timer calls this again so the integration heals itself instead of quietly
-    going stale."""
+def _register_playblast_integration():
+    """(Re-)patch the pipeline addon's playblast operator, if installed. Safe
+    to call repeatedly — that addon's own dev-mode hot-reload (Reload Scripts
+    / addon toggle) replaces its module's classes with fresh, unpatched ones,
+    silently undoing our patch. A periodic timer calls this again so the
+    integration heals itself instead of quietly going stale."""
     global _playblast_patched_engine_cls
     try:
         import camops.operators.ops_playblast as _co_playblast
@@ -758,15 +679,15 @@ def _register_camops_playblast_integration():
     cls.start_job = _playblast_patched_start_job
     cls.finish = _playblast_patched_finish
     _playblast_patched_engine_cls = cls
-    _log("CamOps Playblast integration active")
+    _log("Playblast integration active")
 
 
 def _playblast_integrity_timer():
-    _register_camops_playblast_integration()
-    return 2.0  # keep checking every 2s in case CamOps hot-reloads mid-session
+    _register_playblast_integration()
+    return 2.0  # keep checking every 2s in case the other addon hot-reloads mid-session
 
 
-def _unregister_camops_playblast_integration():
+def _unregister_playblast_integration():
     global _playblast_patched_engine_cls
     if _playblast_patched_engine_cls is None:
         return
@@ -1075,37 +996,10 @@ class TOKENS_Preferences(bpy.types.AddonPreferences):
     )
     token_aliases: CollectionProperty(type=TokenAlias)
 
-    compositor_guard_enabled: BoolProperty(
-        name="Compositor Guard",
-        default=False,
-        description=(
-            "Delete the default render output file when only Compositing is "
-            "enabled (Sequencer off) in Post Processing. Empty folders are "
-            "cleaned up after the render finishes. Tokens in the filepath "
-            "are still restored after render."
-        ),
-    )
-
     def draw(self, context):
         layout = self.layout
 
         layout.operator("render_tokens.update", icon="FILE_REFRESH")
-        layout.separator(factor=0.5)
-
-        # ── Compositor Guard ──────────────────────────────────────
-        cg_row = layout.row()
-        cg_row.scale_y = 1.2
-        cg_row.prop(
-            self, "compositor_guard_enabled",
-            toggle=True,
-            icon="LOCKED" if self.compositor_guard_enabled else "UNLOCKED",
-        )
-        if self.compositor_guard_enabled:
-            cg_box = layout.box()
-            cg_col = cg_box.column(align=True)
-            cg_col.label(text="Active when Compositing is ON and Sequencer is OFF.", icon="INFO")
-            cg_col.label(text="Default output file is removed every frame; empty folders cleaned up after render.")
-
         layout.separator(factor=0.5)
 
         # ── Rename Tokens ─────────────────────────────────────────────────────
@@ -1605,7 +1499,6 @@ def register():
     if hasattr(bpy.app.handlers, "render_init"):
         bpy.app.handlers.render_init.append(_on_render_init)
     bpy.app.handlers.render_pre.append(_on_render_pre)
-    bpy.app.handlers.render_write.append(_on_render_write)
     bpy.app.handlers.render_post.append(_on_render_post)
     bpy.app.handlers.render_cancel.append(_on_render_cancel)
     if hasattr(bpy.app.handlers, "render_complete"):
@@ -1627,16 +1520,16 @@ def register():
         return None  # do not repeat
     bpy.app.timers.register(_delayed_preset_init, first_interval=0.1)
     bpy.app.timers.register(_subscribe_filepath, first_interval=0.2)
-    _register_camops_playblast_integration()
+    _register_playblast_integration()
     if not bpy.app.timers.is_registered(_playblast_integrity_timer):
         bpy.app.timers.register(_playblast_integrity_timer, first_interval=2.0)
-    _log("v1.0.3 registered")
+    _log("v1.0.4 registered")
 
 
 def unregister():
     if bpy.app.timers.is_registered(_playblast_integrity_timer):
         bpy.app.timers.unregister(_playblast_integrity_timer)
-    _unregister_camops_playblast_integration()
+    _unregister_playblast_integration()
     handlers = [
         (_on_render_pre,    bpy.app.handlers.render_pre),
         (_on_render_write,  bpy.app.handlers.render_write),
@@ -1657,7 +1550,7 @@ def unregister():
             delattr(bpy.types.Scene, name)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
-    _log("v1.0.3 unregistered")
+    _log("v1.0.4 unregistered")
 
 
 if __name__ == "__main__":
